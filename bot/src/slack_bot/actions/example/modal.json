@@ -1,0 +1,40 @@
+{
+  "type": "modal",
+  "title": {
+    "type": "plain_text",
+    "text": "Example Action"
+  },
+  "submit": {
+    "type": "plain_text",
+    "text": "Submit"
+  },
+  "close": {
+    "type": "plain_text",
+    "text": "Cancel"
+  },
+  "blocks": [
+    {
+      "type": "section",
+      "text": {
+        "type": "mrkdwn",
+        "text": "This is an example action. Fill out the form below:"
+      }
+    },
+    {
+      "type": "input",
+      "block_id": "example_input_block",
+      "element": {
+        "type": "plain_text_input",
+        "action_id": "example_input",
+        "placeholder": {
+          "type": "plain_text",
+          "text": "Enter some text..."
+        }
+      },
+      "label": {
+        "type": "plain_text",
+        "text": "Example Input"
+      }
+    }
+  ]
+}
