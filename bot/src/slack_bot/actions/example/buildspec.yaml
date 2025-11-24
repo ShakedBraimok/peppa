@@ -1,0 +1,24 @@
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - echo "Starting example action"
+      - echo "User ID: $USER_ID"
+      - echo "User Name: $USER_NAME"
+
+  build:
+    commands:
+      - echo "Processing request..."
+      - sleep 5
+      - echo "Example action completed successfully"
+
+  post_build:
+    commands:
+      - |
+        # Send completion notification
+        aws lambda invoke \
+          --function-name ${NOTIFIER_FUNCTION_NAME} \
+          --payload "{\"notification_type\":\"direct-message\",\"user_id\":\"${USER_ID}\",\"message\":\"✅ Example action completed successfully!\"}" \
+          response.json
+      - cat response.json
