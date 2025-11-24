@@ -1,0 +1,261 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Production-ready Slack Bot infrastructure with monitoring and DLQ
+
+Parameters:
+  Environment:
+    Type: String
+    Description: Environment name
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Default: dev
+
+  BotName:
+    Type: String
+    Description: Name of the Slack bot
+    Default: senora
+
+  EnableXRay:
+    Type: String
+    Description: Enable AWS X-Ray tracing
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: !Ref BotName
+        POWERTOOLS_LOG_LEVEL: !If [IsProd, INFO, DEBUG]
+        BOT_NAME: !Ref BotName
+    Tracing: !If [EnableTracing, Active, PassThrough]
+    Tags:
+      Environment: !Ref Environment
+      Project: !Ref BotName
+      ManagedBy: SAM
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  EnableTracing: !Equals [!Ref EnableXRay, 'true']
+
+Resources:
+  # Secrets Manager for Slack credentials
+  SlackSecretToken:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '/${BotName}/${Environment}/slack-secret-token'
+      Description: Slack signing secret and bot token
+      SecretString: !Sub |
+        {
+          "slack_signing_secret": "REDACTED_TOKEN",
+          "slack_bot_token": "REPLACE_WITH_YOUR_BOT_TOKEN"
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref BotName
+
+  # Dead Letter Queue for failed Lambda invocations
+  BotDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${BotName}-${Environment}-bot-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref BotName
+
+  # Slack Bot Lambda Function
+  SlackBotFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${BotName}-${Environment}-bot'
+      CodeUri: src/slack_bot/
+      Handler: main.lambda_handler
+      Description: Production Slack bot with comprehensive error handling
+      ReservedConcurrentExecutions: !If [IsProd, 10, 5]
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt BotDLQ.Arn
+      Environment:
+        Variables:
+          SLACK_SECRET_TOKEN: !Ref SlackSecretToken
+          NOTIFIER_FUNCTION_NAME: !Ref NotifierFunction
+      Policies:
+        - REDACTED_TOKEN:
+            SecretArn: !Ref SlackSecretToken
+        - Statement:
+            - Effect: Allow
+              Action:
+                - codebuild:StartBuild
+                - codebuild:BatchGetBuilds
+              Resource: !Sub 'arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${BotName}-${Environment}-*'
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sqs:SendMessage
+              Resource: !GetAtt BotDLQ.Arn
+      Events:
+        SlackApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SlackBotApi
+            Path: /slack
+            Method: POST
+
+  # API Gateway
+  SlackBotApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub '${BotName}-${Environment}-api'
+      StageName: !Ref Environment
+      TracingEnabled: !If [EnableTracing, true, false]
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiLogGroup.Arn
+        Format: '$context.requestId $context.error.message $context.error.messageString'
+      MethodSettings:
+        - HttpMethod: '*'
+          ResourcePath: '/*'
+          LoggingLevel: !If [IsProd, ERROR, INFO]
+          DataTraceEnabled: !If [IsProd, false, true]
+          MetricsEnabled: true
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref BotName
+
+  # API Gateway Log Group
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${BotName}-${Environment}'
+      RetentionInDays: !If [IsProd, 90, 30]
+
+  # Notifier Lambda Function
+  NotifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${BotName}-${Environment}-notifier'
+      CodeUri: src/slack_notifier/
+      Handler: main.lambda_handler
+      Description: Sends Slack notifications after action completion
+      Timeout: 15
+      ReservedConcurrentExecutions: !If [IsProd, 5, 2]
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt NotifierDLQ.Arn
+      Environment:
+        Variables:
+          SLACK_SECRET_TOKEN: !Ref SlackSecretToken
+      Policies:
+        - REDACTED_TOKEN:
+            SecretArn: !Ref SlackSecretToken
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sqs:SendMessage
+              Resource: !GetAtt NotifierDLQ.Arn
+
+  # Notifier DLQ
+  NotifierDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${BotName}-${Environment}-notifier-dlq'
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarms
+  BotErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${BotName}-${Environment}-bot-errors'
+      AlarmDescription: Slack bot Lambda errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !If [IsProd, 3, 10]
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SlackBotFunction
+      TreatMissingData: notBreaching
+
+  BotDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${BotName}-${Environment}-bot-dlq-messages'
+      AlarmDescription: Messages in bot DLQ
+      MetricName: REDACTED_TOKEN
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt BotDLQ.QueueName
+
+  NotifierErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${BotName}-${Environment}-notifier-errors'
+      AlarmDescription: Notifier Lambda errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref NotifierFunction
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway URL for Slack configuration
+    Value: !Sub 'https://${SlackBotApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/slack'
+    Export:
+      Name: !Sub '${BotName}-${Environment}-api-url'
+
+  BotFunctionArn:
+    Description: Slack Bot Lambda Function ARN
+    Value: !GetAtt SlackBotFunction.Arn
+    Export:
+      Name: !Sub '${BotName}-${Environment}-bot-arn'
+
+  NotifierFunctionArn:
+    Description: Notifier Lambda Function ARN
+    Value: !GetAtt NotifierFunction.Arn
+    Export:
+      Name: !Sub '${BotName}-${Environment}-notifier-arn'
+
+  NotifierFunctionName:
+    Description: Notifier Lambda Function Name
+    Value: !Ref NotifierFunction
+    Export:
+      Name: !Sub '${BotName}-${Environment}-notifier-name'
+
+  BotDLQUrl:
+    Description: Bot Dead Letter Queue URL
+    Value: !Ref BotDLQ
+
+  SecretArn:
+    Description: Secrets Manager secret ARN
+    Value: !Ref SlackSecretToken
